@@ -20,7 +20,7 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 class MomentumScalper:
-    def __init__(self, symbol='ETH-USDC', trade_amount=1000, profit_target=0.20, loss_limit=0.20, wait_time=5):
+    def __init__(self, symbol='ETH-USDC', trade_amount=100, profit_target=1, loss_limit=1.5, wait_time=5):
         self.symbol = symbol
         self.trade_amount = trade_amount
         self.profit_target = profit_target
@@ -39,9 +39,6 @@ class MomentumScalper:
             domain='https://eea.okx.com',
             api_key=API_KEY, api_secret_key=API_SECRET, passphrase=PASSPHRASE, flag='1'
         )
-
-        self.current_position = 0.0
-        self.buy_price = 0.0
 
     async def start(self):
         logger.info("Starting Momentum Scalper Bot")
@@ -69,10 +66,14 @@ class MomentumScalper:
                 logger.info("Buy Signal — EMA crossover & RSI healthy")
                 await self.place_buy_order(current_price)
         else:
-            target_price = (self.buy_price + self.profit_target) * (1 + 0.0008)
-            stop_price = self.buy_price - self.loss_limit
+            ordId = self.get_last_order_id()
+            # Fetch order details
+            order_info = self.trade_api.get_order(instId=self.symbol, ordId=ordId)
+            fill_price = float(order_info['data'][0]['fillPx'])
+            target_price = (fill_price + self.profit_target) + 0.08 / 100 * (fill_price + self.profit_target)
+            stop_price = fill_price - self.loss_limit
 
-            logger.info(f"Position held at {self.buy_price:.2f}, Target: {target_price:.2f}, Stop: {stop_price:.2f}")
+            logger.info(f"Position held at {current_price:.2f}, Target: {target_price:.2f}, Stop: {stop_price:.2f}")
 
             if current_price >= target_price:
                 sell_qty = self.truncate(self.get_asset_balance(),6)
@@ -118,6 +119,7 @@ class MomentumScalper:
         result = self.trade_api.place_order(
                 instId=self.symbol, tdMode='cash', side='buy', ordType='market', sz=str(100))
         if result['code'] == '0':
+            self.order_id = result['data'][0]['ordId']
             logger.info(f"Placed market buy for {eth_amount} ETH at ~{price:.2f}")
             # Update to fetch actual filled size
             await asyncio.sleep(1)
@@ -176,6 +178,17 @@ class MomentumScalper:
         if result < min_value:
             return 0.0
         return result
+    
+    def get_last_order_id(self):
+        instType = 'SPOT'
+        instId = self.symbol
+    #Fetch the most recent order's ID.
+        response = self.trade_api.get_orders_history(instType=instType, instId=instId)
+        orders = response['data']
+        if not orders:
+            return None
+        last_order = orders[0]
+        return last_order['ordId']
 
 if __name__ == "__main__":
     scalper = MomentumScalper()
