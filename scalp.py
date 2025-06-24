@@ -65,7 +65,7 @@ class MomentumScalper:
         logger.info(f"EMA5: {ema5:.2f}, EMA20: {ema20:.2f}, RSI: {rsi:.2f}, Bollinger lower band: {bollinger_bands:.2f}, VWAP: {vwap:.2f}, Price: {current_price:.2f}")
         self.current_position = self.get_asset_balance()
         if self.current_position <= 0.000001:
-            if ema5 > ema20 and rsi < 70 and current_price <= bollinger_bands and current_price > vwap:
+            if ema5 > ema20 and rsi < 70 and current_price <= bollinger_bands:
                 logger.info("Buy Signal — EMA crossover & RSI healthy")
                 await self.place_buy_order(current_price)
         else:
@@ -204,7 +204,7 @@ class MomentumScalper:
         upper_band = sma + (num_std_dev * std_dev)
         lower_band = sma - (num_std_dev * std_dev)
 
-        return lower_band
+        return lower_band + 0.1 * lower_band
     
     def calculate_vwap(self, candles):
         """
