@@ -1,9 +1,10 @@
 import asyncio
 import logging
 import json
+import statistics
 import math
 from datetime import datetime, timezone, timedelta
-from okx import Trade, Account, MarketData
+from okx import Trade, Account, MarketData, okxclient
 
 # Load API keys
 with open('config.json') as f:
@@ -56,13 +57,15 @@ class MomentumScalper:
 
         ema5 = self.calculate_ema(candles, 5)
         ema20 = self.calculate_ema(candles, 20)
+        bollinger_bands = self.calculate_bollinger_bands(candles,20,2)
+        vwap = self.calculate_vwap(candles)
         rsi = self.calculate_rsi(candles, 14)
         current_price = float(candles[-1][4])
 
-        logger.info(f"EMA5: {ema5:.2f}, EMA20: {ema20:.2f}, RSI: {rsi:.2f}, Price: {current_price:.2f}")
+        logger.info(f"EMA5: {ema5:.2f}, EMA20: {ema20:.2f}, RSI: {rsi:.2f}, Bollinger lower band: {bollinger_bands:.2f}, VWAP: {vwap:.2f}, Price: {current_price:.2f}")
         self.current_position = self.get_asset_balance()
         if self.current_position <= 0.000001:
-            if ema5 > ema20 and rsi < 70:
+            if ema5 > ema20 and rsi < 70 and current_price <= bollinger_bands and current_price > vwap:
                 logger.info("Buy Signal — EMA crossover & RSI healthy")
                 await self.place_buy_order(current_price)
         else:
@@ -85,7 +88,7 @@ class MomentumScalper:
                 await self.place_sell_order(sell_qty)
 
     def get_candles(self):
-        resp = self.market_api.get_candlesticks(instId=self.symbol, bar='1m', limit=50)
+        resp = self.market_api.get_candlesticks(instId=self.symbol, bar='1m', limit=400)
         return resp['data'][::-1]  # reverse to chronological order
 
     def calculate_ema(self, candles, period):
@@ -189,6 +192,43 @@ class MomentumScalper:
             return None
         last_order = orders[0]
         return last_order['ordId']
+    
+    def calculate_bollinger_bands(self, candles, period, num_std_dev):
+        closes = [float(k[4]) for k in candles]
+        if len(closes) < period:
+            return None, None, None
+
+        sma = sum(closes[-period:]) / period
+        std_dev = statistics.stdev(closes[-period:])
+
+        upper_band = sma + (num_std_dev * std_dev)
+        lower_band = sma - (num_std_dev * std_dev)
+
+        return lower_band
+    
+    def calculate_vwap(self, candles):
+        """
+        candles: list of candle lists/tuples: [timestamp, open, high, low, close, volume]
+        Assumes candles are ordered oldest to newest.
+        """
+        cumulative_vp = 0  # cumulative volume * typical price
+        cumulative_vol = 0
+
+        for candle in candles:
+            high = float(candle[2])
+            low = float(candle[3])
+            close = float(candle[4])
+            volume = float(candle[5])
+            typical_price = (high + low + close) / 3
+            cumulative_vp += typical_price * volume
+            cumulative_vol += volume
+
+        if cumulative_vol == 0:
+            return None  # avoid division by zero
+
+        vwap = cumulative_vp / cumulative_vol
+        return vwap
+
 
 if __name__ == "__main__":
     scalper = MomentumScalper()
