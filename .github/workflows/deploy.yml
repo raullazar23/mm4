@@ -8,7 +8,6 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,7 +17,17 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keyscan -p "${{ secrets.EC2_PORT }}" "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
 
-      # Copy only the files needed to build/run (do NOT include config.json)
+      - name: Ensure target dir exists
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_PORT }}
+          script: |
+            sudo mkdir -p /opt/scalper
+            sudo chown $USER:$USER /opt/scalper
+
       - name: Upload app files to EC2
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -31,10 +40,10 @@ jobs:
             requirements.txt
             docker-compose.yml
             scalp.py
-            observability/**   # if you kept these (won't be used on AWS path)
+            observability/**
           target: /opt/scalper
           overwrite: true
-          strip_components: 0
+          debug: true
 
       - name: Build & restart container on EC2
         uses: appleboy/ssh-action@v1.0.3
@@ -46,12 +55,12 @@ jobs:
           script: |
             set -e
             cd /opt/scalper
-            # sanity: keep your secrets file in place
             if [ ! -f config.json ]; then
-              echo "MISSING /opt/scalper/config.json (put your API keys there)" >&2
+              echo "ERROR: /opt/scalper/config.json missing (put API keys on server)" >&2
               exit 1
             fi
             docker compose down || true
             docker compose build
             docker compose up -d
             docker image prune -f || true
+            docker compose ps
