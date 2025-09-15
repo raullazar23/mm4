@@ -16,7 +16,7 @@ jobs:
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -p "${{ secrets.EC2_PORT }}" "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
-
+      
       - name: Ensure target dir exists
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -27,7 +27,7 @@ jobs:
           script: |
             sudo mkdir -p /opt/scalper
             sudo chown $USER:$USER /opt/scalper
-
+      
       - name: Upload app files to EC2
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -44,7 +44,7 @@ jobs:
           target: /opt/scalper
           overwrite: true
           debug: true
-
+      
       - name: Build & restart container on EC2
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -64,3 +64,4 @@ jobs:
             docker compose up -d
             docker image prune -f || true
             docker compose ps
+      
