@@ -2,3 +2,5 @@ python-okx
 python-dateutil
 requests
 asyncio
+ccxt
+websockets

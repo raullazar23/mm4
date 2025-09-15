@@ -1,20 +1,23 @@
-# Use an official Python runtime as a parent image
 FROM python:3.11-slim
 
-# Set working directory in the container
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TZ=Etc/UTC
+
 WORKDIR /app
 
-# Copy your requirements file and install dependencies
-COPY requirements.txt .
+# Install build deps only if needed; keep image small
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates tzdata && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python deps (better layer caching)
+COPY requirements.txt /app/
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# Copy your entire project into the container
-COPY . .
+# Copy app code
+COPY scalp.py /app/scalp.py
 
-# Set environment variables if needed (optional)
-# ENV API_KEY=your_key
-# ENV API_SECRET=your_secret
-
-# Run the script
-CMD ["python", "./scalp.py"]
+# Run
+CMD ["python", "-u", "scalp.py"]

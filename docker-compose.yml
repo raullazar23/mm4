@@ -1,0 +1,64 @@
+version: "3.8"
+
+services:
+  bot:
+    build: .
+    image: scalper-bot:latest
+    container_name: scalper-bot
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./config.json:/app/config.json:ro
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: eu-north-1          # set your AWS region
+        awslogs-group: /scalper/bot        # auto-created by awslogs driver
+        awslogs-stream: scalper-bot
+        awslogs-create-group: "true"
+
+
+  loki:
+    image: grafana/loki:2.9.6
+    container_name: loki
+    command: ["-config.file=/etc/loki/config.yml"]
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki/config.yml:/etc/loki/config.yml:ro
+      - loki-data:/loki
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:2.9.6
+    container_name: promtail
+    command: ["--config.file=/etc/promtail/config.yml"]
+    volumes:
+      # reads Docker JSON logs
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/log:/var/log:ro
+      - ./observability/promtail/config.yml:/etc/promtail/config.yml:ro
+      - promtail-positions:/positions
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.4.5
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./observability/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    restart: unless-stopped
+
+volumes:
+  loki-data:
+  promtail-positions:
+  grafana-data:
+

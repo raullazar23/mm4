@@ -1,10 +1,15 @@
 import asyncio
-import logging
+import contextlib
 import json
-import statistics
+import logging
 import math
-from datetime import datetime, timezone, timedelta
-from okx import Trade, Account, MarketData
+import statistics
+import time
+from datetime import datetime, timezone
+
+import ccxt            # pip install ccxt
+import websockets      # pip install websockets
+
 
 # ================== CONFIG ==================
 with open('config.json') as f:
@@ -12,125 +17,191 @@ with open('config.json') as f:
 
 API_KEY = config["API_KEY"]
 API_SECRET = config["API_SECRET"]
-PASSPHRASE = config["PASSPHRASE"]
 
 # ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('ccxt.base.exchange').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
 class MomentumScalper:
-    def __init__(self, symbol='ETH-EUR', trade_amount=100, profit_target=1, loss_limit=1.5, wait_time=5):
+    """
+    Binance USDT-M Futures scalper using 1-second candles from aggTrade.
+    Goal: +$0.50 net per round-trip (after taker fees), regardless of position size.
+    """
+
+    def __init__(
+        self,
+        symbol: str = "ETH/USDT",     # USDT-M perpetual
+        trade_amount: float = 50.0,   # USDT per entry (converted to qty)
+        net_target_usd: float = 0.50, # desired NET profit in USDT per trade
+        taker_fee: float = 0.0004,    # 0.04% default on Binance futures; adjust if needed
+        wait_time: float = 1.0,       # seconds between decision cycles
+        use_testnet: bool = True,     # show activity in testnet UI
+        leverage: int = 5,
+        margin_mode: str = "cross",
+        keep_seconds: int = 600,      # ~10 minutes of 1-second bars
+        min_warmup_seconds: int = 180,# need this many 1s bars before trading
+        use_forward_fill: bool = True # forward-fill missing seconds
+    ):
         self.symbol = symbol
-        self.trade_amount = trade_amount      # sumă în QUOTE (EUR) pentru MARKET BUY
-        self.profit_target = profit_target    # profit absolut per ETH (ex: +1 EUR/ETH)
-        self.loss_limit = loss_limit          # stop absolut per ETH
-        self.wait_time = wait_time
-        self.bar = "1m"
+        self.trade_amount = float(trade_amount)
+        self.net_target_usd = float(net_target_usd)
+        self.taker_fee = float(taker_fee)
+        self.wait_time = float(wait_time)
+        self.keep_ms = int(keep_seconds * 1000)
+        self.min_warmup_seconds = int(min_warmup_seconds)
+        self.use_ffill = bool(use_forward_fill)
 
-        # buffer local cu istoric (ASC) sub forma [ts, o, h, l, c, vol]
-        self.candles = []
+        # internal state / data
+        self.candles_1s = []  # ASC: [ts_ms, o, h, l, c, v]
+        self.ws_task = None
 
-        # OKX clients
-        self.market_api = MarketData.MarketAPI(
-            domain='https://eea.okx.com',
-            api_key=API_KEY, api_secret_key=API_SECRET, passphrase=PASSPHRASE, flag='1'
-        )
-        self.trade_api = Trade.TradeAPI(
-            domain='https://eea.okx.com',
-            api_key=API_KEY, api_secret_key=API_SECRET, passphrase=PASSPHRASE, flag='1'
-        )
-        self.account_api = Account.AccountAPI(
-            domain='https://eea.okx.com',
-            api_key=API_KEY, api_secret_key=API_SECRET, passphrase=PASSPHRASE, flag='1'
-        )
+        # position state
+        self.last_buy_order_id = None
+        self.entry_price = 0.0
+        self.position_qty = 0.0  # in base (ETH)
+        self.tp_price = None
+        self.sl_price = None
 
-    # ================== ORCHESTRATOR ==================
+        # base/quote split
+        try:
+            self.base_ccy, self.quote_ccy = self.symbol.split("/")
+        except Exception:
+            raise ValueError("Symbol must be like 'ETH/USDT'")
+
+        # CCXT: Binance USDT-M futures client
+        self.ex = ccxt.binanceusdm({
+            "apiKey": API_KEY,
+            "secret": API_SECRET,
+            "options": {"defaultType": "future"},
+            "enableRateLimit": True,
+        })
+        self.ex.set_sandbox_mode(bool(use_testnet))
+        self.ex.load_markets()
+
+        self.leverage = int(leverage)
+        self.margin_mode = margin_mode.lower()
+
+        self._setup_futures_account()
+
+    # ---------- Setup ----------
+    def _setup_futures_account(self):
+        try:
+            # one-way (not hedged)
+            if hasattr(self.ex, "set_position_mode"):
+                self.ex.set_position_mode(hedged=False)
+            # margin mode
+            if hasattr(self.ex, "set_margin_mode"):
+                self.ex.set_margin_mode(self.margin_mode.upper(), self.symbol)
+            # leverage
+            if hasattr(self.ex, "set_leverage"):
+                self.ex.set_leverage(self.leverage, self.symbol)
+        except Exception as e:
+            logger.warning(f"Futures account setup warning: {e}")
+
+    # ---------- Lifecycle ----------
     async def start(self):
-        logger.info("Starting Momentum Scalper Bot")
+        logger.info("Starting Futures scalper (1s live data; %+0.2f USDT net target)", self.net_target_usd)
         await self.cancel_all_orders()
-        self.backfill_last_day()
 
-        while True:
-            await self.run_cycle()
-            await asyncio.sleep(self.wait_time)
+        # seed a small window from recent trades (best-effort)
+        self._seed_from_recent_trades(minutes=5)
 
+        # start websocket aggregator for 1s bars
+        self.ws_task = asyncio.create_task(self._ws_aggtrade_to_1s())
+
+        try:
+            while True:
+                await self.run_cycle()
+                await asyncio.sleep(self.wait_time)
+        finally:
+            if self.ws_task and not self.ws_task.done():
+                self.ws_task.cancel()
+                with contextlib.suppress(Exception):
+                    await self.ws_task
+
+    # ---------- Core loop ----------
     async def run_cycle(self):
-        # update incremental (1m) și cere 24h min
-        self.refresh_incremental()
-        if not self.has_full_day():
-            logger.info("Nu am încă 24h de date, sar ciclul...")
+        candles = self._get_contiguous_1s_window()
+        if len(candles) < self.min_warmup_seconds:
+            logger.info("Warming up 1s data: %d/%d", len(candles), self.min_warmup_seconds)
             return
 
-        candles = self.candles  # ASC, confirmate
-        if len(candles) < 300:
-            logger.info("Istoric insuficient pentru indicatori stabili (min 300).")
+        closes = [c[4] for c in candles]
+        vols   = [c[5] for c in candles]
+
+        # ---- Indicators (1s) ----
+        ema_fast = self._ema_series(closes, 20)
+        ema_slow = self._ema_series(closes, 60)
+        rsi      = self._rsi_series(closes, 14)
+        vwap     = self._vwap(candles)                  # 10m rolling window by design
+        bb_lower = self._bb_lower(closes, period=60, k=2)
+        atr_60   = self._atr(candles, period=60)        # for stop sizing
+
+        if not ema_fast or not ema_slow or not rsi:
             return
 
-        # ---------- indicatori calculați pe fereastră mare ----------
-        closes = [float(c[4]) for c in candles]
-        vols   = [float(c[5]) for c in candles]
+        px = closes[-1]
+        ema_fast_now = ema_fast[-1]
+        ema_slow_now = ema_slow[-1]
+        rsi_now = rsi[-1] if rsi[-1] is not None else float("nan")
 
-        ema5_series   = self.calculate_ema_series(closes, 5)
-        ema20_series  = self.calculate_ema_series(closes, 20)
-        rsi_series    = self.calculate_rsi_series(closes, 14)
-        lower_band    = self.calculate_bollinger_lower(candles, 20, 2)
-        vwap_value    = self.calculate_vwap(candles)     # VWAP pe sesiunea curentă
-        current_price = float(candles[-1][4])
-
-        ema5 = ema5_series[-1]
-        ema20 = ema20_series[-1]
-        rsi = rsi_series[-1]
+        trend_up = ema_fast_now > ema_slow_now and ema_slow[-1] > (ema_slow[-2] if len(ema_slow) >= 2 else ema_slow[-1])
 
         logger.info(
-            f"EMA5: {ema5:.2f}, EMA20: {ema20:.2f}, RSI: {rsi:.2f}, "
-            f"Bollinger lower: {lower_band:.2f}, VWAP: {vwap_value:.2f}, Price: {current_price:.2f}"
+            "1s | px=%.2f ema20=%.2f>ema60=%.2f? %s | rsi=%.1f | vwap=%.2f | bbL=%.2f | atr60=%.3f",
+            px, ema_fast_now, ema_slow_now, trend_up, rsi_now, vwap, bb_lower, atr_60
         )
 
-        # ---------- confirmare pe ultimele K lumânări ----------
-        K = 3
-        ema_bull_seq = [a > b for a, b in zip(ema5_series, ema20_series)]
-        ema_bear_seq = [a < b for a, b in zip(ema5_series, ema20_series)]
-        ema_bull_ok = self.confirm_last_k(ema_bull_seq, K)
-        # ema_bear_ok = self.confirm_last_k(ema_bear_seq, K)  # disponibil dacă vrei short logic
+        # Refresh position snapshot
+        self.position_qty = self._get_position_qty()
+        in_pos = abs(self.position_qty) > 1e-9
 
-        self.current_position = self.get_asset_balance()  # ETH disponibil
+        # ---- Position management (TP/SL) ----
+        if in_pos:
+            self.entry_price = self._get_entry_price() or self.entry_price or px
+            # Recompute TP/SL continuously (in case fees or size changed)
+            self.tp_price = self._compute_take_profit(self.entry_price, abs(self.position_qty))
+            self.sl_price = self._compute_stop_loss(self.entry_price, atr_60)
 
-        if self.current_position <= 0.000001:
-            # intrare „mai safe”: ema5>ema20 confirmat + rsi sub 70 + preț aproape de partea de jos a canalului
-            if ema_bull_ok and (rsi is not None and rsi < 70) and current_price <= lower_band:
-                logger.info("Buy Signal — EMA crossover confirmat & RSI ok & sub lower band")
-                await self.place_buy_order(current_price)
-        else:
-            ordId = self.get_last_order_id()
-            if not ordId:
-                logger.warning("Nu am găsit ultimul order id pentru poziție.")
-                return
-            order_info = self.trade_api.get_order(instId=self.symbol, ordId=ordId)
-            fill_price = float(order_info['data'][0]['fillPx'])
+            logger.info("POS qty=%.6f @ %.2f | TP=%.2f | SL=%.2f", self.position_qty, self.entry_price, self.tp_price, self.sl_price)
 
-            # țintă și stop absolut (ținând cont de fee 0.08% pe ieșire)
-            target_price = (fill_price + self.profit_target) * (1 + 0.0008)
-            stop_price = fill_price - self.loss_limit
+            # exits (reduce-only)
+            if px >= self.tp_price:
+                qty = self._truncate_amount(abs(self.position_qty))
+                if qty > 0:
+                    logger.info("TP hit — closing %.6f", qty)
+                    await self._market_sell(qty, reduce_only=True)
+                    return
+            if px <= self.sl_price:
+                qty = self._truncate_amount(abs(self.position_qty))
+                if qty > 0:
+                    logger.info("SL hit — closing %.6f", qty)
+                    await self._market_sell(qty, reduce_only=True)
+                    return
 
-            logger.info(f"Position held at {current_price:.2f}, Target: {target_price:.2f}, Stop: {stop_price:.2f}")
+        # ---- Entry logic (long only) ----
+        if not in_pos:
+            # High-accuracy filter: uptrend + momentum healthy + not extended down vs VWAP + pullback proximity
+            pullback_ok = px <= max(bb_lower, ema_fast_now)
+            rsi_ok = (not math.isnan(rsi_now)) and (45 <= rsi_now <= 70)
+            if trend_up and rsi_ok and px >= vwap and pullback_ok:
+                qty = self._size_from_quote(px, self.trade_amount)
+                qty = self.max_qty_using_only_cash()
+                if qty > 0:
+                    logger.info("ENTRY signal: trend_up=%s rsi_ok=%s pullback_ok=%s → BUY %.6f", trend_up, rsi_ok, pullback_ok, qty)
+                    await self._market_buy(qty)
+                    # after entry, recompute TP/SL instantly
+                    self.position_qty = self._get_position_qty()
+                    self.entry_price = self._get_entry_price() or px
+                    self.tp_price = self._compute_take_profit(self.entry_price, abs(self.position_qty))
+                    self.sl_price = self._compute_stop_loss(self.entry_price, atr_60)
+                    logger.info("After entry: qty=%.6f @ %.2f | TP=%.2f | SL=%.2f", self.position_qty, self.entry_price, self.tp_price, self.sl_price)
 
-            if current_price >= target_price:
-                sell_qty = self.truncate(self.get_asset_balance(), 6)
-                if sell_qty > 0:
-                    logger.info("Profit target reached — selling")
-                    await self.place_sell_order(sell_qty)
-            elif current_price <= stop_price:
-                sell_qty = self.truncate(self.get_asset_balance(), 6)
-                if sell_qty > 0:
-                    logger.info("Stop-loss hit — selling")
-                    await self.place_sell_order(sell_qty)
-
-    # ================== INDICATORI „SAFE” ==================
-    def calculate_ema_series(self, closes, period: int):
-        """EMA list-aligned; seed SMA la prima fereastră pentru stabilitate."""
-        if len(closes) == 0:
+    # ---------- Indicators ----------
+    def _ema_series(self, closes, period: int):
+        if not closes:
             return []
         if period <= 1:
             return closes[:]
@@ -140,31 +211,28 @@ class MomentumScalper:
             if i == 0:
                 ema.append(p)
             elif i < period:
-                prev = ema[-1]
-                ema.append(prev + k * (p - prev))
+                ema.append(ema[-1] + k * (p - ema[-1]))
             elif i == period - 1:
                 sma = sum(closes[:period]) / period
                 ema[-1] = sma
                 ema.append(sma + k * (closes[period] - sma))
             else:
-                prev = ema[-1]
-                ema.append(prev + k * (p - prev))
+                ema.append(ema[-1] + k * (p - ema[-1]))
         return ema
 
-    def calculate_rsi_series(self, closes, period: int = 14):
-        """RSI cu smoothing (Wilder). Returnează listă aliniată cu closes (primele valori None)."""
+    def _rsi_series(self, closes, period: int = 14):
         n = len(closes)
         if n == 0 or period <= 0:
             return []
         gains = [0.0]
         losses = [0.0]
         for i in range(1, n):
-            delta = closes[i] - closes[i-1]
-            gains.append(max(delta, 0.0))
-            losses.append(max(-delta, 0.0))
+            d = closes[i] - closes[i - 1]
+            gains.append(max(d, 0.0))
+            losses.append(max(-d, 0.0))
         rsi = []
-        avg_gain = sum(gains[1:period+1]) / period if n > period else sum(gains) / max(1, len(gains))
-        avg_loss = sum(losses[1:period+1]) / period if n > period else sum(losses) / max(1, len(losses))
+        avg_gain = sum(gains[1:period + 1]) / period if n > period else sum(gains) / max(1, len(gains))
+        avg_loss = sum(losses[1:period + 1]) / period if n > period else sum(losses) / max(1, len(losses))
         for i in range(n):
             if i < period:
                 rsi.append(None)
@@ -178,264 +246,358 @@ class MomentumScalper:
                 rsi.append(100 - (100 / (1 + rs)))
         return rsi
 
-    def calculate_bollinger_lower(self, candles, period, num_std_dev):
-        """Returnează doar banda INFERIOARĂ (float) calculată corect."""
-        closes = [float(k[4]) for k in candles]
+    def _bb_lower(self, closes, period=60, k=2):
         if len(closes) < period:
             return float('nan')
         window = closes[-period:]
         sma = sum(window) / period
-        std_dev = statistics.pstdev(window) if len(window) > 1 else 0.0
-        lower_band = sma - num_std_dev * std_dev
-        return lower_band
+        std = statistics.pstdev(window) if len(window) > 1 else 0.0
+        return sma - k * std
 
-    def calculate_vwap(self, candles):
-        """VWAP cumulativ pe sesiune (toată seria primită)."""
-        cumulative_vp = 0.0
-        cumulative_vol = 0.0
-        for candle in candles:
-            high = float(candle[2]); low = float(candle[3]); close = float(candle[4]); volume = float(candle[5])
-            typical_price = (high + low + close) / 3.0
-            cumulative_vp += typical_price * volume
-            cumulative_vol += volume
-        return (cumulative_vp / cumulative_vol) if cumulative_vol else float('nan')
+    def _atr(self, candles, period=60):
+        """True Range with previous close; on 1s data this approximates to high-low."""
+        if len(candles) < period + 1:
+            return 0.0
+        trs = []
+        for i in range(1, len(candles)):
+            prev_c = candles[i - 1][4]
+            h = candles[i][2]
+            l = candles[i][3]
+            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+            trs.append(tr)
+        window = trs[-period:]
+        return sum(window) / len(window) if window else 0.0
 
-    def confirm_last_k(self, seq_bool, k=3):
-        if len(seq_bool) < k:
-            return False
-        return all(seq_bool[-k:])
+    def _vwap(self, candles):
+        """Session VWAP over the kept window (~10 minutes)."""
+        vp = 0.0
+        vol = 0.0
+        for _, _, h, l, c, v in candles:
+            typical = (h + l + c) / 3.0
+            vp += typical * v
+            vol += v
+        return (vp / vol) if vol else float('nan')
 
-    # ================== ORDERS ==================
-    async def place_buy_order(self, ref_price_for_log: float):
+    # ---------- Targets & sizing ----------
+    def _compute_take_profit(self, entry_price: float, qty_base: float) -> float:
         """
-        MARKET BUY folosind sumă în QUOTE (EUR) via tgtCcy='quote_ccy'.
+        Solve for dP so that NET PnL >= net_target_usd considering taker fees on both legs.
+        Net = qty*dP - fee*qty*(2*entry + dP)  >= target
+        => dP >= (target/qty + 2*fee*entry) / (1 - fee)
         """
-        result = self.trade_api.place_order(
-            instId=self.symbol, tdMode='cash', side='buy', ordType='market',
-            sz=str(self.trade_amount), tgtCcy='quote_ccy'
-        )
-        if result['code'] == '0':
-            self.order_id = result['data'][0]['ordId']
-            logger.info(f"Placed market buy for ~{self.trade_amount} {self.symbol.split('-')[1]} (ref price {ref_price_for_log:.2f})")
-            await asyncio.sleep(1)  # scurt delay pentru a lăsa fill-urile să apară
-            filled_qty = self.get_asset_balance()
-            if filled_qty == 0:
-                logger.error("No buy fills found")
+        fee = self.taker_fee
+        qty = max(qty_base, 1e-12)
+        dP = (self.net_target_usd / qty + 2 * fee * entry_price) / max(1e-9, (1 - fee))
+        raw_tp = entry_price + dP
+        # snap to price precision & ensure at least one tick above entry
+        tp = self._price_to_precision(max(raw_tp, entry_price + self._min_tick()))
+        return tp
+
+    def _compute_stop_loss(self, entry_price: float, atr_60: float) -> float:
+        # protective stop: max(1.5*ATR_60s, 0.2% of entry)
+        dist = max(1.5 * atr_60, entry_price * 0.002)
+        raw_sl = entry_price - dist
+        sl = self._price_to_precision(min(raw_sl, entry_price - self._min_tick()))
+        return sl
+
+    def _size_from_quote(self, price: float, quote_amount: float) -> float:
+        qty = quote_amount / max(price, 1e-12)
+        qty = self._truncate_amount(qty)
+        return qty
+
+    # ---------- Broker ops ----------
+    async def _market_buy(self, qty: float):
+        try:
+            qty = self._truncate_amount(qty)
+            if qty <= 0:
                 return
-            self.current_position = round(filled_qty, 6)
-            self.buy_price = ref_price_for_log
-            logger.info(f"Bought {self.current_position} {self.symbol.split('-')[0]}")
-        else:
-            logger.error(f"Buy order failed: {result}")
+            self.ex.create_order(self.symbol, "market", "buy", qty, params={"reduceOnly": False})
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.error(f"Buy failed: {e}")
 
-    async def place_sell_order(self, sell_qty: float):
-        """
-        MARKET SELL cu cantitate în BASE (ETH).
-        """
-        result = self.trade_api.place_order(
-            instId=self.symbol, tdMode='cash', side='sell', ordType='market', sz=str(sell_qty)
-        )
-        if result['code'] == '0':
-            logger.info(f"Sold {sell_qty} {self.symbol.split('-')[0]} at market")
-            self.current_position = 0.0
-            self.buy_price = 0.0
-        else:
-            logger.error(f"Sell order failed: {result}")
+    async def _market_sell(self, qty: float, reduce_only: bool = True):
+        try:
+            qty = self._truncate_amount(qty)
+            if qty <= 0:
+                return
+            self.ex.create_order(self.symbol, "market", "sell", qty, params={"reduceOnly": bool(reduce_only)})
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            logger.error(f"Sell failed: {e}")
 
     async def cancel_all_orders(self):
-        open_orders = self.trade_api.get_order_list(instType='SPOT', instId=self.symbol)
-        for order in open_orders.get('data', []):
-            self.trade_api.cancel_order(instId=self.symbol, ordId=order['ordId'])
-        logger.info("All open orders cancelled")
-
-    # ================== UTILS ==================
-    def usd_to_eth(self, amount_quote=None):
-        """Conversie simplă pentru loguri (nu pentru sizing exact)."""
-        amount_quote = self.trade_amount if amount_quote is None else amount_quote
-        ticker = self.market_api.get_ticker(self.symbol)
-        if ticker['code'] != '0':
-            logger.error(f"Failed to fetch ticker: {ticker}")
-            return 0.0
-        ask_price = float(ticker['data'][0]['askPx'])
-        base_amount = round(amount_quote / ask_price, 6) if ask_price else 0.0
-        logger.info(f"Converting {amount_quote} {self.symbol.split('-')[1]} → {base_amount} {self.symbol.split('-')[0]} at ask {ask_price:.2f}")
-        return base_amount
-
-    def get_asset_balance(self):
-        base_ccy = self.symbol.split('-')[0]
-        balances = self.account_api.get_account_balance()
-        for balance in balances['data'][0]['details']:
-            if balance['ccy'] == base_ccy:
-                return float(balance['availBal'])
-        return 0.0
-
-    def truncate(self, number, decimals):
-        min_value = 0.00001
-        factor = 10.0 ** decimals
-        truncated = math.trunc(number * factor)
-        result = truncated / factor
-        return 0.0 if result < min_value else result
-
-    def get_last_order_id(self):
-        response = self.trade_api.get_orders_history(instType='SPOT', instId=self.symbol)
-        orders = response.get('data', [])
-        if not orders:
-            return None
-        last_order = orders[0]
-        return last_order['ordId']
-
-    # ================== BACKFILL + INCREMENTAL ==================
-    def _okx_confirm(self, row) -> int:
-        """
-        OKX /market/candles:         [ts,o,h,l,c,vol,volCcy,volCcyQuote,confirm] (len >= 9)
-        OKX /market/history-candles: [ts,o,h,l,c,vol,volCcy,confirm]             (len >= 8)
-        """
-        if len(row) >= 9:
-            return int(row[8])
-        if len(row) >= 8:
-            return int(row[7])
-        return 1
-
-    def _fetch_candles(self, *, before=None, after=None, limit=300):
-        """
-        GET /api/v5/market/candles
-        - 'after'  => înregistrări MAI VECHI decât ts (timestamp mai MIC).
-        - 'before' => înregistrări MAI NOI  decât ts (timestamp mai MARE). Folosit singur => ultimele date.
-        Returnează lista 'data' (cele mai noi primele).
-        """
-        params = {"instId": self.symbol, "bar": self.bar, "limit": limit}
-        if before is not None:
-            params["before"] = str(int(before))
-        if after is not None:
-            params["after"] = str(int(after))
-        res = self.market_api.get_candlesticks(**params)
-        return res.get("data", [])
-
-    def _fetch_history(self, *, before=None, after=None, limit=100):
-        """GET /api/v5/market/history-candles (fallback)"""
-        params = {"instId": self.symbol, "bar": self.bar, "limit": limit}
-        if before is not None:
-            params["before"] = str(int(before))
-        if after is not None:
-            params["after"] = str(int(after))
         try:
-            res = self.market_api.get_history_candlesticks(**params)
-            return res.get("data", [])
+            for o in self.ex.fetch_open_orders(self.symbol):
+                with contextlib.suppress(Exception):
+                    self.ex.cancel_order(o["id"], self.symbol)
+            logger.info("All open orders cancelled.")
+        except Exception as e:
+            logger.info(f"No open orders or fetch failed: {e}")
+
+    def _get_position_qty(self) -> float:
+        try:
+            pos = None
+            if hasattr(self.ex, "fetch_positions"):
+                arr = self.ex.fetch_positions([self.symbol])
+                if arr:
+                    pos = arr[0]
+            if not pos:
+                return 0.0
+            # CCXT normalized
+            contracts = pos.get("contracts")
+            if contracts is not None:
+                return float(contracts)
+            # raw
+            return float(pos["info"].get("positionAmt", 0))
+        except Exception as e:
+            logger.warning(f"fetch_positions error: {e}")
+            return 0.0
+
+    def _get_entry_price(self):
+        try:
+            arr = self.ex.fetch_positions([self.symbol])
+            if arr:
+                p = arr[0]
+                ep = p.get("entryPrice")
+                if ep is not None:
+                    return float(ep)
+                raw = p["info"].get("entryPrice")
+                return float(raw) if raw else None
+            return None
         except Exception:
+            return None
+
+    # ---------- Precision helpers ----------
+    def _truncate_amount(self, qty: float) -> float:
+        try:
+            return float(self.ex.amount_to_precision(self.symbol, qty))
+        except Exception:
+            factor = 10 ** 6
+            return math.trunc(qty * factor) / factor
+
+    def _price_to_precision(self, p: float) -> float:
+        try:
+            return float(self.ex.price_to_precision(self.symbol, p))
+        except Exception:
+            factor = 10 ** 2
+            return math.trunc(p * factor) / factor
+
+    def _min_tick(self) -> float:
+        try:
+            m = self.ex.market(self.symbol)
+            step = None
+            if "limits" in m and m["limits"].get("price"):
+                step = m["limits"]["price"].get("min") or m["precision"].get("price")
+            # CCXT may not expose exact tick; fallback by precision
+            if not step:
+                prec = m["precision"]["price"]
+                step = 10 ** (-prec)
+            return float(step)
+        except Exception:
+            return 0.01
+
+    # ---------- 1-second bars (WebSocket & seed) ----------
+    def _ws_url_aggtrade(self) -> str:
+        """
+        Futures aggTrade stream:
+        Testnet: wss://stream.binancefuture.com/ws/<symbol>@aggTrade
+        Prod:    wss://fstream.binance.com/ws/<symbol>@aggTrade
+        """
+        sym = self.symbol.replace("/", "").lower()  # ETH/USDT -> ethusdt
+        base = "wss://stream.binancefuture.com/ws" if self.ex.sandboxMode else "wss://fstream.binance.com/ws"
+        return f"{base}/{sym}@aggTrade"
+
+    def _append_1s(self, row):
+        """row = [ts, o, h, l, c, v]"""
+        if not row:
+            return
+        ts = row[0]
+        if self.candles_1s and self.candles_1s[-1][0] == ts:
+            last = self.candles_1s[-1]
+            last[2] = max(last[2], row[2])
+            last[3] = min(last[3], row[3])
+            last[4] = row[4]
+            last[5] += row[5]
+        else:
+            self.candles_1s.append(row)
+
+        # trim to last keep_ms
+        cutoff = int(time.time() * 1000) - self.keep_ms
+        while self.candles_1s and self.candles_1s[0][0] < cutoff:
+            self.candles_1s.pop(0)
+
+    def _get_contiguous_1s_window(self):
+        if not self.candles_1s:
             return []
+        if not self.use_ffill:
+            return list(self.candles_1s)
+        # forward-fill gaps up to now-1s
+        data = list(self.candles_1s)
+        end_ms = (int(time.time()) - 1) * 1000
+        if not data:
+            return []
+        filled = [data[0][:]]
+        for i in range(1, len(data)):
+            prev_ts = filled[-1][0]
+            ts, o, h, l, c, v = data[i]
+            expected = prev_ts + 1000
+            if ts == expected:
+                filled.append([ts, o, h, l, c, v])
+            elif ts > expected:
+                # fill missing seconds with flat candles (vol=0)
+                last_close = filled[-1][4]
+                while expected < ts:
+                    filled.append([expected, last_close, last_close, last_close, last_close, 0.0])
+                    expected += 1000
+                filled.append([ts, o, h, l, c, v])
+            # if ts < expected (out-of-order), ignore
+        # fill until end_ms
+        if filled:
+            last_ts = filled[-1][0]
+            last_close = filled[-1][4]
+            t = last_ts + 1000
+            while t <= end_ms:
+                filled.append([t, last_close, last_close, last_close, last_close, 0.0])
+                t += 1000
+        return filled
 
-    def backfill_last_day(self):
+    def _seed_from_recent_trades(self, minutes=5):
         """
-        Strategie robustă:
-        1) Ia un lot de „ultimele” lumânări (fără cursor) -> cele mai noi primele.
-        2) Dacă cel mai vechi ts din out e > since_ms, mergi ÎNAPOI în timp cu after=oldest_ts (mai vechi).
-        3) Continuă până acoperi 24h sau rar -> fallback pe /history-candles.
-        4) Normalizează la [ts,o,h,l,c,vol] ASC, doar confirmate și în fereastra 24h.
+        Best-effort seed: fetch recent trades and bucket into 1s bars.
+        On quiet testnet, this might produce sparse data (ffill will handle gaps).
         """
-        since_ms = int((datetime.now(timezone.utc) - timedelta(days=1)).timestamp() * 1000)
-        out = []
+        try:
+            since = self.ex.milliseconds() - minutes * 60 * 1000
+            trades = self.ex.fetch_trades(self.symbol, since=since, limit=1000)
+        except Exception as e:
+            logger.info(f"fetch_trades seed failed: {e}")
+            return
 
-        # pas 1: ultima pagină (cele mai noi)
-        batch = self._fetch_candles(limit=300)
-        if batch:
-            out.extend(batch)
-        else:
-            # fallback direct
-            batch = self._fetch_history(limit=100)
-            out.extend(batch)
+        buckets = {}  # ts_sec_ms -> [ts, o, h, l, c, v]
+        for t in trades:
+            p = float(t["price"])
+            q = float(t["amount"])
+            ts = int(t["timestamp"] // 1000 * 1000)
+            b = buckets.get(ts)
+            if b is None:
+                buckets[ts] = [ts, p, p, p, p, q]
+            else:
+                b[2] = max(b[2], p)
+                b[3] = min(b[3], p)
+                b[4] = p
+                b[5] += q
 
-        max_iters = 200
-        iter_count = 0
+        for ts in sorted(buckets.keys()):
+            self._append_1s(buckets[ts])
+
+        logger.info("Seeded %d seconds from recent trades.", len(buckets))
+
+    async def _ws_aggtrade_to_1s(self):
+        url = self._ws_url_aggtrade()
+        backoff = 1
         while True:
-            iter_count += 1
-            if iter_count > max_iters:
-                logger.warning("backfill_last_day: max iters reached; breaking to avoid loop.")
-                break
-            if not out:
-                break
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                    logger.info("WS connected: %s", url)
+                    buckets = {}
+                    while True:
+                        raw = await ws.recv()
+                        msg = json.loads(raw)
+                        p = float(msg.get("p"))
+                        q = float(msg.get("q"))
+                        t = int(msg.get("T"))
+                        ts = (t // 1000) * 1000
+                        b = buckets.get(ts)
+                        if b is None:
+                            buckets[ts] = [ts, p, p, p, p, q]
+                        else:
+                            b[2] = max(b[2], p)
+                            b[3] = min(b[3], p)
+                            b[4] = p
+                            b[5] += q
 
-            # cel mai vechi ts din ce avem până acum (în batch-urile OKX datele sunt DESC)
-            oldest_ts = min(int(r[0]) for r in out)
-            if oldest_ts <= since_ms:
-                break  # avem acoperire până la since_ms
+                        # flush fully closed seconds (<= now - 1s)
+                        flush_before = (int(time.time()) - 1) * 1000
+                        to_emit = [k for k in buckets.keys() if k <= flush_before]
+                        for k in sorted(to_emit):
+                            self._append_1s(buckets.pop(k))
+            except Exception as e:
+                logger.warning(f"WS error ({type(e).__name__}): {e}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
 
-            # pas 2: mergem mai vechi cu after=oldest_ts
-            older = self._fetch_candles(after=oldest_ts, limit=300)
-            if not older:
-                # fallback: history
-                older = self._fetch_history(after=oldest_ts, limit=100)
-
-            if not older:
-                logger.info("backfill_last_day: no more older data; break.")
-                break
-
-            prev_min = oldest_ts
-            out.extend(older)
-
-            new_min = min(int(r[0]) for r in older)
-            if new_min >= prev_min:
-                # fără progres (SDK ignoră cursorul) => ieșim
-                logger.warning("backfill_last_day: no pagination progress (after=%s -> min still %s).", oldest_ts, new_min)
-                break
-
-        # Normalizează: confirmate + în fereastra 24h + sort ASC
-        norm = []
-        for r in out:
-            ts = int(r[0])
-            confirm = self._okx_confirm(r)
-            if ts >= since_ms and confirm == 1:
-                norm.append([ts, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])])
-        norm.sort(key=lambda x: x[0])
-        self.candles = norm
-
-        if self.candles:
-            span = (self.candles[-1][0] - self.candles[0][0]) / 1000
-            logger.info("Backfill: %d candles, span %.1f min (%.2f h).", len(self.candles), span/60, span/3600)
-        else:
-            logger.warning("Backfill: 0 candles loaded.")
-
-    def refresh_incremental(self):
+    def get_cash_available_usdt(self) -> float:
         """
-        Ia DOAR barele noi față de ultimul timestamp din cache:
-        - latest_ts = self.candles[-1][0]
-        - folosim before=latest_ts pentru a obține „mai noi decât ts” (spre prezent)
-        - deduplicăm și păstrăm ASC
+        Returns your *own* free USDT (wallet collateral not tied up in margin/fees)
+        on Binance USDT-M Futures. No leverage multipliers — plain available cash.
         """
-        if not getattr(self, "candles", None):
-            self.backfill_last_day()
-            return
+        try:
+            bal = self.ex.fetch_balance()  # futures wallet
+            # CCXT-normalized path
+            if isinstance(bal, dict) and 'free' in bal and self.quote_ccy in bal['free']:
+                v = bal['free'][self.quote_ccy]
+                return float(v) if v is not None else 0.0
 
-        latest_ts = int(self.candles[-1][0])
-        # cerem cele mai noi față de ce avem
-        batch = self._fetch_candles(before=latest_ts, limit=300)
-        if not batch:
-            return
+            # Fallback to raw Binance fields
+            info = bal.get('info', {})
+            # Sometimes 'info' is a list of assets
+            if isinstance(info, list):
+                for a in info:
+                    if a.get('asset') == self.quote_ccy:
+                        v = a.get('availableBalance') or a.get('withdrawAvailable') or a.get('balance')
+                        return float(v) if v is not None else 0.0
+            # Or a dict with nested assets
+            assets = info.get('assets') or info.get('balances') if isinstance(info, dict) else None
+            if isinstance(assets, list):
+                for a in assets:
+                    if a.get('asset') == self.quote_ccy:
+                        v = a.get('availableBalance') or a.get('walletBalance') or a.get('maxWithdrawAmount')
+                        return float(v) if v is not None else 0.0
 
-        latest = {}
-        for r in batch:
-            ts = int(r[0])
-            confirm = self._okx_confirm(r)
-            if confirm == 0:
-                continue
-            latest[ts] = [ts, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])]
+            return 0.0
+        except Exception as e:
+            logger.warning(f"get_cash_available_usdt error: {e}")
+            return 0.0
+    
+    def max_qty_using_only_cash(self, price: float | None = None, fee_rate: float | None = None, buffer: float = 0.001) -> float:
+        """
+        Max BASE qty you can buy using *only your cash* (no leverage).
+        Reserves a small `buffer` fraction for fees/rounding.
+        Formula ensures: notional + taker_fee*notional <= cash_available*(1 - buffer).
+        """
+        try:
+            fee = self.taker_fee if fee_rate is None else float(fee_rate)
+            if price is None:
+                price = float(self.ex.fetch_ticker(self.symbol)['last'])
+            cash = self.get_cash_available_usdt()
+            cash_eff = max(0.0, cash * (1.0 - float(buffer)))
+            notional = cash_eff / (1.0 + fee)  # leave room to pay taker fee from cash
+            qty = notional / max(price, 1e-12)
+            return self._truncate_amount(qty)
+        except Exception as e:
+            logger.warning(f"max_qty_using_only_cash error: {e}")
+            return 0.0
 
-        existing = {row[0]: row for row in self.candles}
-        existing.update(latest)
-        merged = sorted(existing.values(), key=lambda x: x[0])
 
-        # păstrăm ultimele 2 zile ca limită de memorie
-        cutoff = int((datetime.now(timezone.utc) - timedelta(days=2)).timestamp() * 1000)
-        self.candles = [r for r in merged if r[0] >= cutoff]
-
-        logger.info("Refresh: now %d candles; newest ts=%s.", len(self.candles), self.candles[-1][0] if self.candles else "n/a")
-
-    def has_full_day(self) -> bool:
-        if not self.candles:
-            return False
-        span_ms = self.candles[-1][0] - self.candles[0][0]
-        return span_ms >= (24 * 60 * 60 * 1000 - 60 * 1000)
+    # ---------- Misc ----------
+    @staticmethod
+    def _fmt_ts(ms: int) -> str:
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 if __name__ == "__main__":
-    scalper = MomentumScalper()
-    asyncio.run(scalper.start())
+    bot = MomentumScalper(
+        symbol="ETH/USDT",
+        trade_amount=50.0,       # USDT per entry (adjust as you like)
+        net_target_usd=0.50,     # net profit target per trade
+        taker_fee=0.0004,        # 0.04% taker
+        use_testnet=True,
+        leverage=5,
+        margin_mode="cross",
+        keep_seconds=600,        # 10 minutes of 1s data
+        min_warmup_seconds=180,  # require 3 min before trading
+        use_forward_fill=True,
+        wait_time=1.0
+    )
+    asyncio.run(bot.start())

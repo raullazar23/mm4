@@ -1,0 +1,6 @@
+.git
+.github
+observability
+config.json
+*.md
+__pycache__/

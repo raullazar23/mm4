@@ -1,1 +1,10 @@
-*.json
+# secrets
+config.json
+
+# python
+__pycache__/
+*.pyc
+
+# docker
+*.log
+.env

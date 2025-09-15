@@ -1,0 +1,30 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /positions/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+    pipeline_stages:
+      - docker: {}   # parse Docker JSON log lines
+    relabel_configs:
+      # container name -> container label (e.g. scalper-bot)
+      - source_labels: ['__meta_docker_container_name']
+        target_label: 'container'
+        regex: '/(.*)'
+      # compose service -> service label (e.g. bot)
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: 'service'
+      # image -> image label
+      - source_labels: ['__meta_docker_image']
+        target_label: 'image'
+      # project name -> project label (optional)
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_project']
+        target_label: 'project'
