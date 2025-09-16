@@ -32,7 +32,7 @@ class MomentumScalper:
 
     def __init__(
         self,
-        symbol: str = "ETH/USDT",     # USDT-M perpetual
+        symbol: str = "BTC/USDT",     # USDT-M perpetual
         trade_amount: float = 50.0,   # USDT per entry (converted to qty)
         net_target_usd: float = 0.50, # desired NET profit in USDT per trade
         taker_fee: float = 0.0004,    # 0.04% default on Binance futures; adjust if needed
@@ -68,7 +68,7 @@ class MomentumScalper:
         try:
             self.base_ccy, self.quote_ccy = self.symbol.split("/")
         except Exception:
-            raise ValueError("Symbol must be like 'ETH/USDT'")
+            raise ValueError("Symbol must be like 'BTC/USDT'")
 
         # CCXT: Binance USDT-M futures client
         self.ex = ccxt.binanceusdm({
@@ -588,7 +588,7 @@ class MomentumScalper:
 
 if __name__ == "__main__":
     bot = MomentumScalper(
-        symbol="ETH/USDT",
+        symbol="BTC/USDT",
         trade_amount=50.0,       # USDT per entry (adjust as you like)
         net_target_usd=0.50,     # net profit target per trade
         taker_fee=0.0004,        # 0.04% taker
