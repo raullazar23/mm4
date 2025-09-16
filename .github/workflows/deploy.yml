@@ -1,5 +1,4 @@
 name: Deploy to EC2
-
 on:
   push:
     branches: [ "main" ]
@@ -16,8 +15,7 @@ jobs:
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -p "${{ secrets.EC2_PORT }}" "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
-      
-          
+
       - name: Ensure target dir exists
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -26,27 +24,33 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           port: ${{ secrets.EC2_PORT }}
           script: |
-            sudo mkdir -p /opt/scalper
-            sudo chown $USER:$USER /opt/scalper
-      
-      - name: Upload app files to EC2
+            sudo install -d -o $USER -g $USER -m 755 /opt/scalper
+
+      # Build a single archive so we don't rely on fragile globs
+      - name: Create deploy tarball
+        run: |
+          set -euo pipefail
+          FILES="Dockerfile requirements.txt docker-compose.yml scalp.py"
+          if [ -d observability ]; then
+            tar czf package.tgz $FILES observability
+          else
+            tar czf package.tgz $FILES
+          fi
+          ls -lh package.tgz
+
+      - name: Upload tarball to EC2
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           port: ${{ secrets.EC2_PORT }}
-          source: |
-            Dockerfile
-            requirements.txt
-            docker-compose.yml
-            scalp.py
-            observability/**
+          source: package.tgz
           target: /opt/scalper
           overwrite: true
           debug: true
-      
-      - name: Build & restart container on EC2
+
+      - name: Extract & restart on EC2
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -56,6 +60,8 @@ jobs:
           script: |
             set -e
             cd /opt/scalper
+            tar xzf package.tgz
+            rm -f package.tgz
             if [ ! -f config.json ]; then
               echo "ERROR: /opt/scalper/config.json missing (put API keys on server)" >&2
               exit 1
@@ -65,4 +71,3 @@ jobs:
             docker compose up -d
             docker image prune -f || true
             docker compose ps
-      
