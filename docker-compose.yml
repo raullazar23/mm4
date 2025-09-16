@@ -18,7 +18,6 @@ services:
         awslogs-stream: scalper-bot
         awslogs-create-group: "true"
 
-
   loki:
     image: grafana/loki:2.9.6
     container_name: loki
