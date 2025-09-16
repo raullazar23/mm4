@@ -17,6 +17,7 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keyscan -p "${{ secrets.EC2_PORT }}" "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
       
+          
       - name: Ensure target dir exists
         uses: appleboy/ssh-action@v1.0.3
         with:
