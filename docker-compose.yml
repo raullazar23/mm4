@@ -17,6 +17,7 @@ services:
         awslogs-group: /scalper/bot        # auto-created by awslogs driver
         awslogs-stream: scalper-bot
         awslogs-create-group: "true"
+        
 
   loki:
     image: grafana/loki:2.9.6
